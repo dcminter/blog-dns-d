@@ -25,6 +25,8 @@ struct Header {
 
 static QUERY: bool = false;
 static INITIAL_OFFSET: u8 = 12;
+static TXT_CLASS:u16 = 16; // (SINK is 40)
+static A_CLASS:u16 = 1; // A
 
 fn main() -> std::io::Result<()> {
     {
@@ -43,19 +45,83 @@ fn main() -> std::io::Result<()> {
                 let qtype = NetworkEndian::read_u16(&buf[next_offset..(next_offset+2)]);
                 next_offset+=2;
                 let qclass = NetworkEndian::read_u16(&buf[next_offset..(next_offset+2)]);
+                next_offset+=2;
 
                 // TODO: Log these and only in debug level(s)
                 println!("Query Name: {}", &qname);
                 println!("id: {}, qr: {}, opcode: {}, aa: {}, tc: {}, rd: {}, ra: {}, z: {}, ad: {}, cd: {}, rcode: {}, qdcount: {}, ancount: {}, nscount: {}, arcount: {}",
                          &header.id, &header.qr, &header.opcode, &header.aa, &header.tc, &header.rd, &header.ra, &header.z, &header.ad, &header.cd, &header.rcode, &header.qdcount, &header.ancount, &header.nscount, &header.arcount);
-                println!("qtype: {}", &qtype); // Always 1 for IN(ternet)
-                println!("qclass: {}", &qclass);
+                println!("qtype: {}", &qtype); // 1 is A, 5 is CNAME, 2 is Name Servers, F is mail servers, 40 is SINK etc.!
+                println!("qclass: {}", &qclass); // Always 1 for IN(ternet)
 
                 // TODO: Build and return a meaningful response!
-                buf[2] = buf[2] | 0b1000_0000; // Set response bit
+                buf[2] |= 0b1000_0000; // Set response bit
+                buf[3] |= 0b1000_0000; // Set recursion available bit
 
+                if qtype == TXT_CLASS {
+                    println!("TXT class record requested!");
 
-                socket.send_to(&buf, &src)?;
+                    let text = b"example=content";
+
+                    let ttl:u32 = 1;
+                    let rdlength:u16 = text.len() as u16;
+
+                    NetworkEndian::write_u32( &mut buf[next_offset .. (next_offset+4)], ttl); // TTL
+                    next_offset += 4;
+                    NetworkEndian::write_u16(&mut buf[next_offset .. (next_offset+2)], rdlength); // RDLENGTH (4 octets)
+                    next_offset += 2;
+
+                    buf[next_offset .. next_offset + usize::try_from(rdlength).unwrap()].clone_from_slice(text);
+                    next_offset += usize::try_from(rdlength).unwrap();
+
+                    let output = &buf[0 .. next_offset];
+                    println!("Output: {:?}", output);
+                    socket.send_to(output, &src)?;
+                } else if qtype == A_CLASS {
+                    println!("A class record requested!");
+
+                    // Set the right header values
+                    NetworkEndian::write_u16( &mut buf[6 .. 8], 1); // 1 answer
+                    NetworkEndian::write_u16( &mut buf[10 .. 12], 0); // 0 additional records
+
+                    // Then we repeat a bunch of stuff (more or less)!
+
+                    // qname - point to the received one
+                    NetworkEndian::write_u16(&mut buf[next_offset .. (next_offset+2)], 12); // Offset 12 (max is 2^14 as 2 bits used to indicate pointer)
+                    buf[next_offset] = 0b1100_0000; // Pointer type
+                    next_offset += 2;
+
+                    // type
+                    NetworkEndian::write_u16(&mut buf[next_offset .. (next_offset+2)], qtype);
+                    next_offset += 2;
+
+                    // class
+                    NetworkEndian::write_u16(&mut buf[next_offset .. (next_offset+2)], qclass);
+                    next_offset += 2;
+
+                    // Now the actual answer stuff...
+                    NetworkEndian::write_u32( &mut buf[next_offset .. (next_offset+4)], 0); // TTL
+                    next_offset += 4;
+                    NetworkEndian::write_u16(&mut buf[next_offset .. (next_offset+2)], 4); // RDLENGTH (4 octets)
+                    next_offset += 2;
+
+                    // DATA...
+                    buf[next_offset] = 127;
+                    next_offset += 1;
+                    buf[next_offset] = 0;
+                    next_offset += 1;
+                    buf[next_offset] = 0;
+                    next_offset += 1;
+                    buf[next_offset] = 1;
+                    next_offset += 1;
+
+                    let output = &buf[0 .. next_offset];
+                    println!("Output: {:?}", output);
+                    socket.send_to(output, &src)?;
+                } else {
+                    socket.send_to(&buf, &src)?;
+                }
+
             } else {
                 println!("Incoming packet wasn't a query! id: {}", &header.id);
             }
