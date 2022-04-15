@@ -60,18 +60,38 @@ fn main() -> std::io::Result<()> {
 
                 if qtype == TXT_CLASS {
                     println!("TXT class record requested!");
+                    // Set the right header values
+                    NetworkEndian::write_u16( &mut buf[6 .. 8], 1); // 1 answer
+                    NetworkEndian::write_u16( &mut buf[10 .. 12], 0); // 0 additional records
+
+                    // Then we repeat a bunch of stuff (more or less)!
+
+                    // qname - point to the received one
+                    NetworkEndian::write_u16(&mut buf[next_offset .. (next_offset+2)], 12); // Offset 12 (max is 2^14 as 2 bits used to indicate pointer)
+                    buf[next_offset] = 0b1100_0000; // Pointer type
+                    next_offset += 2;
+
+                    // type
+                    NetworkEndian::write_u16(&mut buf[next_offset .. (next_offset+2)], qtype);
+                    next_offset += 2;
+
+                    // class
+                    NetworkEndian::write_u16(&mut buf[next_offset .. (next_offset+2)], qclass);
+                    next_offset += 2;
+
+
+                    NetworkEndian::write_u32( &mut buf[next_offset .. (next_offset+4)], 0); // TTL
+                    next_offset += 4;
 
                     let text = b"example=content";
-
-                    let ttl:u32 = 1;
-                    let rdlength:u16 = text.len() as u16;
-
-                    NetworkEndian::write_u32( &mut buf[next_offset .. (next_offset+4)], ttl); // TTL
-                    next_offset += 4;
+                    let rdlength:u16 = (text.len() + 1) as u16;
                     NetworkEndian::write_u16(&mut buf[next_offset .. (next_offset+2)], rdlength); // RDLENGTH (4 octets)
                     next_offset += 2;
 
-                    buf[next_offset .. next_offset + usize::try_from(rdlength).unwrap()].clone_from_slice(text);
+                    buf[next_offset] = text.len() as u8;
+                    next_offset += 1;
+
+                    buf[next_offset .. next_offset + usize::try_from(text.len()).unwrap()].clone_from_slice(text);
                     next_offset += usize::try_from(rdlength).unwrap();
 
                     let output = &buf[0 .. next_offset];
