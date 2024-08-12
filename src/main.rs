@@ -1,9 +1,28 @@
+use clap::Parser;
+use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::error::Error;
 use std::net::UdpSocket;
 use std::str;
 use zerocopy::byteorder::network_endian::{I32, U16};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
+
+#[derive(Parser, Debug)]
+#[command(version = env ! ("CARGO_PKG_VERSION"), author = env ! ("CARGO_PKG_AUTHORS"), about, long_about = None
+)]
+struct Opts {
+    /// The message to return
+    #[arg(short, long, default_value = "Hello world!")]
+    message: Option<String>,
+
+    /// The value to store in the dictionary
+    #[arg(short, long)]
+    qname: String,
+
+    /// Logging level (if any)
+    #[arg(short, long, default_value = "off")]
+    logs: Option<String>,
+}
 
 #[derive(Debug, FromZeroes, FromBytes, AsBytes)]
 #[repr(packed)]
@@ -33,27 +52,81 @@ struct ResourceRecord {
     record_data: Vec<u8>,
 }
 
-const QR_MASK: u16 = 0b1000000000000001;
+const QR_MASK: u16 = 0b1000000000000000;
 const OPCODE_MASK: u16 = 0b0111100000000000;
 const AA_MASK: u16 = 0b0000010000000000;
 const TC_MASK: u16 = 0b0000001000000000;
 const RD_MASK: u16 = 0b0000000100000000;
 const RA_MASK: u16 = 0b0000000010000000;
-const Z_MASK: u16 = 0b0000000001110000;
 const RCODE_MASK: u16 = 0b0000000000001111;
 
-trait FlagsAware {
-    fn qr(&self) -> bool;
-    fn opcode(&self) -> u8;
-    fn aa(&self) -> bool;
-    fn tc(&self) -> bool;
-    fn rd(&self) -> bool;
-    fn ra(&self) -> bool;
-    fn z(&self) -> bool;
-    fn rcode(&self) -> u8;
+#[derive(PartialEq, Eq, Hash)]
+enum OpCode {
+    QUERY,
+    IQUERY,
+    STATUS,
 }
 
-impl FlagsAware for Header {
+impl OpCode {
+    fn value(&self) -> u16 {
+        match *self {
+            OpCode::QUERY => 0b0_0000_00000000000,
+            OpCode::IQUERY => 0b0_0001_00000000000,
+            OpCode::STATUS => 0b0_0010_00000000000
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Hash)]
+enum RCode {
+    NoError,
+    FormatError,
+    ServerFailure,
+    NameError,
+    NotImplemented,
+    Refused,
+}
+
+impl RCode {
+    fn value(&self) -> u16 {
+        match *self {
+            RCode::NoError => 0b000000000000_0000,
+            RCode::FormatError => 0b000000000000_0001,
+            RCode::ServerFailure => 0b000000000000_0010,
+            RCode::NameError => 0b000000000000_0011,
+            RCode::NotImplemented => 0b000000000000_0100,
+            RCode::Refused => 0b000000000000_0101
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Hash)]
+enum HeaderFlag {
+    QR,
+    OPCODE(OpCode),
+    AA,
+    TC,
+    RD,
+    RA,
+    // Z bits are reserved and must be zero, so not included in this enum
+    RCODE(RCode),
+}
+
+impl HeaderFlag {
+    fn mask(&self) -> u16 {
+        match *self {
+            HeaderFlag::QR => 0b1000000000000000,
+            HeaderFlag::OPCODE(_) => 0b0111100000000000,
+            HeaderFlag::AA => 0b0000010000000000,
+            HeaderFlag::TC => 0b0000001000000000,
+            HeaderFlag::RD => 0b0000000100000000,
+            HeaderFlag::RA => 0b0000000010000000,
+            HeaderFlag::RCODE(_) => 0b0000000000001111
+        }
+    }
+}
+
+impl Header {
     fn qr(&self) -> bool {
         (self.flags_and_codes.get() & QR_MASK) != 0
     }
@@ -78,10 +151,6 @@ impl FlagsAware for Header {
         (self.flags_and_codes.get() & RA_MASK) != 0
     }
 
-    fn z(&self) -> bool {
-        (self.flags_and_codes.get() & Z_MASK) != 0
-    }
-
     fn rcode(&self) -> u8 {
         ((self.flags_and_codes.get() & RCODE_MASK) >> 12) as u8
     }
@@ -93,9 +162,17 @@ const INITIAL_OFFSET: u8 = 12;
 const MAX_UDP_QUERY_SIZE: usize = 512;
 
 fn main() -> std::io::Result<()> {
+    let options: Opts = Opts::parse();
+    let _ = options.logs.unwrap(); // TODO... set up and use logging!
+
+    let message = options.message.unwrap_or("No message".to_string());
+    let qname = options.qname;
+
     print!("Binding socket...");
     let socket = UdpSocket::bind("127.0.0.1:53")?;
     println!("bound.");
+
+    println!("Will respond with {} for domain {}", message, qname);
 
     let mut query_buffer = [0; MAX_UDP_QUERY_SIZE];
     let mut response_buffer = [0; MAX_UDP_QUERY_SIZE];
@@ -106,7 +183,7 @@ fn main() -> std::io::Result<()> {
 
         let header = Header::ref_from(&query_buffer[0..12]).unwrap();
         println!("ID: {}, (Flags), QD: {}, AN: {}, NS: {}, AR: {}", header.id, header.qdcount, header.ancount, header.nscount, header.arcount);
-        println!("QR: {}, OPCODE: {}, AA: {}, TC: {}, RD: {}, RA: {}, Z: {}, RCODE: {}", header.qr(), header.opcode(), header.aa(), header.tc(), header.rd(), header.ra(), header.z(), header.rcode());
+        println!("QR: {}, OPCODE: {}, AA: {}, TC: {}, RD: {}, RA: {}, RCODE: {}", header.qr(), header.opcode(), header.aa(), header.tc(), header.rd(), header.ra(), header.rcode());
 
         // TODO: Handle bad record counts
 
@@ -165,7 +242,7 @@ fn main() -> std::io::Result<()> {
 
             println!("Creating resource record response");
 
-            let response_text = "OUTPUT".as_bytes();
+            let response_text = message.as_bytes();
             let response_text_length: u8 = response_text.len() as u8;
             let mut response_data = Vec::new();
             response_data.push(response_text_length);
@@ -197,6 +274,36 @@ fn main() -> std::io::Result<()> {
         }
     }
 }
+
+/*
+    QR,
+    OPCODE(OpCode),
+    AA,
+    TC,
+    RD,
+    RA,
+    // Z bits are reserved and must be zero, so not included in this enum
+    RCODE(RCode)
+
+ */
+fn set_flags_and_codes(flags: HashSet<HeaderFlag>) -> u16 {
+    let mut result: u16 = 0;
+    flags.iter().for_each(|flag| {
+        match flag {
+            HeaderFlag::QR | HeaderFlag::AA | HeaderFlag::TC | HeaderFlag::RD | HeaderFlag::RA => {
+                result |= flag.mask();
+            }
+            HeaderFlag::OPCODE(code) => {
+                result |= code.value();
+            }
+            HeaderFlag::RCODE(code) => {
+                result |= code.value();
+            }
+        }
+    });
+    result
+}
+
 
 // TODO: Make this actually return a proper error response
 fn respond_with_error() {
@@ -293,5 +400,31 @@ fn query_class_to_string_slice(p: u16) -> &'static str {
         QCLASS_HS => "HS",
         QCLASS_ANY => "*",
         _ => "UNKNOWN"
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    #[test]
+    fn test_set_opcode_flag() {
+        assert_eq!(set_flags_and_codes(HashSet::from([HeaderFlag::OPCODE(OpCode::QUERY)])), 0b0_0000_00000000000);
+        assert_eq!(set_flags_and_codes(HashSet::from([HeaderFlag::OPCODE(OpCode::IQUERY)])), 0b0_0001_00000000000);
+        assert_eq!(set_flags_and_codes(HashSet::from([HeaderFlag::OPCODE(OpCode::STATUS)])), 0b0_0010_00000000000);
+    }
+
+    #[test]
+    fn test_set_rpcode_flag() {
+        assert_eq!(set_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::NoError)])), 0b000000000000_0000);
+        assert_eq!(set_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::FormatError)])), 0b000000000000_0001);
+        assert_eq!(set_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::ServerFailure)])), 0b000000000000_0010);
+        assert_eq!(set_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::NameError)])), 0b000000000000_0011);
+        assert_eq!(set_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::NotImplemented)])), 0b000000000000_0100);
+        assert_eq!(set_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::Refused)])), 0b000000000000_0101);
+    }
+
+    #[test]
+    fn test_combine_some_flag() {
+        assert_eq!(set_flags_and_codes(HashSet::from([HeaderFlag::QR, HeaderFlag::AA, HeaderFlag::TC, HeaderFlag::RD, HeaderFlag::RA])), 0b1_0000_1_1_1_1_000_0000);
     }
 }
