@@ -4,7 +4,7 @@ use log;
 use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::error::Error;
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 use std::str;
 use zerocopy::byteorder::network_endian::{I32, U16};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
@@ -75,7 +75,7 @@ impl OpCode {
         match *self {
             OpCode::QUERY => 0b0_0000_00000000000,
             OpCode::IQUERY => 0b0_0001_00000000000,
-            OpCode::STATUS => 0b0_0010_00000000000
+            OpCode::STATUS => 0b0_0010_00000000000,
         }
     }
 }
@@ -99,7 +99,7 @@ impl RCode {
             RCode::ServerFailure => 0b000000000000_0010,
             RCode::NameError => 0b000000000000_0011,
             RCode::NotImplemented => 0b000000000000_0100,
-            RCode::Refused => 0b000000000000_0101
+            RCode::Refused => 0b000000000000_0101,
         }
     }
 }
@@ -126,7 +126,7 @@ impl HeaderFlag {
             HeaderFlag::TC => 0b0000001000000000,
             HeaderFlag::RD => 0b0000000100000000,
             HeaderFlag::RA => 0b0000000010000000,
-            HeaderFlag::RCODE(_) => 0b0000000000001111
+            HeaderFlag::RCODE(_) => 0b0000000000001111,
         }
     }
 }
@@ -161,14 +161,13 @@ impl Header {
     }
 }
 
-
 const QUERY: bool = false;
 const INITIAL_OFFSET: u8 = 12;
 const MAX_UDP_QUERY_SIZE: usize = 512;
 
 const DEFAULT_LOGGING_ENV_VAR: &str = "BLOG_DNSD_LOG";
 
-fn main() -> std::io::Result<()> {
+fn main() -> Result<(), Box<dyn Error>> {
     let options: Opts = Opts::parse();
     let logging_level = options.logs.unwrap();
 
@@ -181,10 +180,14 @@ fn main() -> std::io::Result<()> {
     let socket = UdpSocket::bind("127.0.0.1:53")?;
     log::debug!("Socket bound.");
 
-    log::info!("Will respond with '{}' for domain '{}'", message, target_qname);
+    log::info!(
+        "Will respond with '{}' for domain '{}'",
+        message,
+        target_qname
+    );
 
     let mut query_buffer = [0; MAX_UDP_QUERY_SIZE];
-    let mut response_buffer = [0; MAX_UDP_QUERY_SIZE];
+    let mut output_buffer = [0; MAX_UDP_QUERY_SIZE];
 
     loop {
         log::debug!("Listening...");
@@ -192,76 +195,121 @@ fn main() -> std::io::Result<()> {
 
         // TODO:: Kick off a thread/task/something to do this instead of blocking the next connection...?
 
-        let header = Header::ref_from(&query_buffer[0..12]).unwrap();
-        log::debug!("ID: {}, (Flags), QD: {}, AN: {}, NS: {}, AR: {}", header.id, header.qdcount, header.ancount, header.nscount, header.arcount);
-        log::debug!("QR: {}, OPCODE: {}, AA: {}, TC: {}, RD: {}, RA: {}, RCODE: {}", header.qr(), header.opcode(), header.aa(), header.tc(), header.rd(), header.ra(), header.rcode());
+        let input_header = Header::ref_from(&query_buffer[0..12]).unwrap();
+        log::debug!(
+            "ID: {}, (Flags), QD: {}, AN: {}, NS: {}, AR: {}",
+            input_header.id,
+            input_header.qdcount,
+            input_header.ancount,
+            input_header.nscount,
+            input_header.arcount
+        );
+        log::debug!(
+            "QR: {}, OPCODE: {}, AA: {}, TC: {}, RD: {}, RA: {}, RCODE: {}",
+            input_header.qr(),
+            input_header.opcode(),
+            input_header.aa(),
+            input_header.tc(),
+            input_header.rd(),
+            input_header.ra(),
+            input_header.rcode()
+        );
 
         // TODO: Handle bad record counts
-        if header.qr() == QUERY {
-            match header.qdcount.get() {
+        if input_header.qr() == QUERY {
+            match input_header.qdcount.get() {
                 1 => {}
                 0 => {
                     // ERROR: Not supposed to be 0 because QR == QUERY
-                    respond_with_error(RCode::FormatError);
+                    respond_with_basic_error(
+                        RCode::FormatError,
+                        input_header,
+                        &mut output_buffer,
+                        &socket,
+                        &src,
+                    )?;
                     continue;
                 }
                 _ => {
                     // ERROR: We don't handle multiple queries
-                    respond_with_error(RCode::Refused);
+                    respond_with_basic_error(
+                        RCode::Refused,
+                        input_header,
+                        &mut output_buffer,
+                        &socket,
+                        &src,
+                    )?;
                     continue;
                 }
             }
 
-            let (qname, next_offset, raw_query_name) = match read_qname(INITIAL_OFFSET, &query_buffer) {
-                Ok((qname, next_offset)) => {
-                    // Returning...
-                    // qname as a nice normal string
-                    // the offset of the next octet in the input buffer
-                    // the raw slice representing the qname so we can steal it for building the response buffer
-                    (qname, next_offset, &query_buffer[INITIAL_OFFSET as usize..next_offset])
-                }
-                Err(err) => {
-                    log::error!("ERROR: {:?}", err);
-                    // Something went horribly wrong; not even trying for a response here...
-                    continue;
-                }
-            };
+            let (qname, next_offset, raw_query_name) =
+                match read_qname(INITIAL_OFFSET, &query_buffer) {
+                    Ok((qname, next_offset)) => {
+                        // Returning...
+                        // qname as a nice normal string
+                        // the offset of the next octet in the input buffer
+                        // the raw slice representing the qname so we can steal it for building the response buffer
+                        (
+                            qname,
+                            next_offset,
+                            &query_buffer[INITIAL_OFFSET as usize..next_offset],
+                        )
+                    }
+                    Err(err) => {
+                        log::error!("ERROR: {:?}", err);
+                        // Something went horribly wrong; not even trying for a response here...
+                        continue;
+                    }
+                };
             log::info!("Query name: {}", qname);
 
-            let type_and_class = TypeAndClass::ref_from(&query_buffer[next_offset..next_offset + 4]).unwrap();
-            log::info!("Query Type: {}, Query Class: {}", query_type_to_string_slice(type_and_class.query_type.get()), query_class_to_string_slice(type_and_class.query_class.get()));
+            let type_and_class =
+                TypeAndClass::ref_from(&query_buffer[next_offset..next_offset + 4]).unwrap();
+            log::info!(
+                "Query Type: {}, Query Class: {}",
+                query_type_to_string_slice(type_and_class.query_type.get()),
+                query_class_to_string_slice(type_and_class.query_class.get())
+            );
 
-            if !qname.eq_ignore_ascii_case(&target_qname) || type_and_class.query_type.get() != TYPE_TXT {
+            if !qname.eq_ignore_ascii_case(&target_qname)
+                || type_and_class.query_type.get() != TYPE_TXT
+            {
                 log::error!("Not a suitable qname query, or not expecting TXT type");
-                respond_with_error(RCode::Refused);
+                // reason: RCode, input_header:&Header, raw_query_name: &[u8], type_and_class: &TypeAndClass, response_buffer: &mut [u8; 512], socket: &UdpSocket, src: &SocketAddr
+                respond_with_qname_error(
+                    RCode::Refused,
+                    input_header,
+                    raw_query_name,
+                    type_and_class,
+                    &mut output_buffer,
+                    &socket,
+                    &src,
+                )?;
                 continue;
             }
 
             log::debug!("Creating header response");
             // Copy OPCODE directly from input and set QR to say this is a query response
-            let response_flags_and_codes: u16 = (header.flags_and_codes.get() & 0b0_1111_0_0_1_0_000_0000) | create_flags_and_codes(HashSet::from([HeaderFlag::QR]));
-
-            let response_header = Header {
-                id: header.id,
-                flags_and_codes: U16::from(response_flags_and_codes),
-                qdcount: U16::from(1), // 1 question record
-                ancount: U16::from(1), // 1 answer records
-                nscount: U16::from(0), // No authority records
-                arcount: U16::from(0), // No additional records
-            };
-
-            // Clear out any previous responses
-            _ = &response_buffer.fill(0);
-
-            let mut index = 0;
-            append_to_buffer(&mut response_buffer, &response_header.as_bytes(), &mut index);
+            let response_flags_and_codes: u16 = (input_header.flags_and_codes.get()
+                & 0b0_1111_0_0_1_0_000_0000)
+                | create_flags_and_codes(HashSet::from([HeaderFlag::QR]));
+            let mut output_index = write_out_header_data(
+                false,
+                &mut output_buffer,
+                input_header,
+                response_flags_and_codes,
+            );
 
             log::debug!("Creating qname response");
-
-            let raw_qname_index = index;
+            let raw_qname_index = output_index;
             let raw_qname_as_bytes: &[u8] = &raw_query_name.as_bytes();
-            append_to_buffer(&mut response_buffer, raw_qname_as_bytes, &mut index);
-            append_to_buffer(&mut response_buffer, &type_and_class.as_bytes(), &mut index);
+            write_out_qname_data(
+                &mut output_buffer,
+                &type_and_class,
+                &mut output_index,
+                raw_qname_as_bytes,
+            );
 
             log::debug!("Creating resource record response");
 
@@ -280,57 +328,197 @@ fn main() -> std::io::Result<()> {
                 record_data: response_data.into(),
             };
 
-            append_to_buffer(&mut response_buffer, &answer_record.name_offset.as_bytes(), &mut index);
-            append_to_buffer(&mut response_buffer, &answer_record.record_type.as_bytes(), &mut index);
-            append_to_buffer(&mut response_buffer, &answer_record.record_class.as_bytes(), &mut index);
-            append_to_buffer(&mut response_buffer, &answer_record.ttl.as_bytes(), &mut index);
-            append_to_buffer(&mut response_buffer, &answer_record.record_length.as_bytes(), &mut index);
-            append_to_buffer(&mut response_buffer, &answer_record.record_data.as_slice(), &mut index);
+            append_to_output_buffer(
+                &mut output_buffer,
+                &answer_record.name_offset.as_bytes(),
+                &mut output_index,
+            );
+            append_to_output_buffer(
+                &mut output_buffer,
+                &answer_record.record_type.as_bytes(),
+                &mut output_index,
+            );
+            append_to_output_buffer(
+                &mut output_buffer,
+                &answer_record.record_class.as_bytes(),
+                &mut output_index,
+            );
+            append_to_output_buffer(
+                &mut output_buffer,
+                &answer_record.ttl.as_bytes(),
+                &mut output_index,
+            );
+            append_to_output_buffer(
+                &mut output_buffer,
+                &answer_record.record_length.as_bytes(),
+                &mut output_index,
+            );
+            append_to_output_buffer(
+                &mut output_buffer,
+                &answer_record.record_data.as_slice(),
+                &mut output_index,
+            );
 
             log::debug!("Sending response.");
 
-            socket.send_to(&response_buffer[0..index], &src)?;
+            socket.send_to(&output_buffer[0..output_index], &src)?;
 
             log::info!("Response sent.");
         } else {
-            respond_with_error(RCode::Refused);
+            respond_with_basic_error(
+                RCode::Refused,
+                input_header,
+                &mut output_buffer,
+                &socket,
+                &src,
+            )?;
         }
     }
 }
 
+fn write_out_qname_data(
+    mut response_buffer: &mut [u8; MAX_UDP_QUERY_SIZE],
+    type_and_class: &&TypeAndClass,
+    mut output_index: &mut usize,
+    raw_qname_as_bytes: &[u8],
+) {
+    append_to_output_buffer(&mut response_buffer, raw_qname_as_bytes, &mut output_index);
+    append_to_output_buffer(
+        &mut response_buffer,
+        &type_and_class.as_bytes(),
+        &mut output_index,
+    );
+}
+
+fn write_out_header_data(
+    error: bool,
+    mut response_buffer: &mut [u8; MAX_UDP_QUERY_SIZE],
+    header: &Header,
+    response_flags_and_codes: u16,
+) -> usize {
+    let ancount = if error { 0 } else { 1 };
+    let response_header = Header {
+        id: header.id,
+        flags_and_codes: U16::from(response_flags_and_codes),
+        qdcount: U16::from(1),       // 1 question record
+        ancount: U16::from(ancount), // 1 answer records
+        nscount: U16::from(0),       // No authority records
+        arcount: U16::from(0),       // No additional records
+    };
+
+    // Clear out any previous responses
+    _ = &response_buffer.fill(0);
+
+    let mut index = 0;
+    append_to_output_buffer(
+        &mut response_buffer,
+        &response_header.as_bytes(),
+        &mut index,
+    );
+    index
+}
+
 fn create_flags_and_codes(flags: HashSet<HeaderFlag>) -> u16 {
     let mut result: u16 = 0;
-    flags.iter().for_each(|flag| {
-        match flag {
-            HeaderFlag::QR | HeaderFlag::AA | HeaderFlag::TC | HeaderFlag::RD | HeaderFlag::RA => {
-                result |= flag.mask();
-            }
-            HeaderFlag::OPCODE(code) => {
-                result |= code.value();
-            }
-            HeaderFlag::RCODE(code) => {
-                result |= code.value();
-            }
+    flags.iter().for_each(|flag| match flag {
+        HeaderFlag::QR | HeaderFlag::AA | HeaderFlag::TC | HeaderFlag::RD | HeaderFlag::RA => {
+            result |= flag.mask();
+        }
+        HeaderFlag::OPCODE(code) => {
+            result |= code.value();
+        }
+        HeaderFlag::RCODE(code) => {
+            result |= code.value();
         }
     });
     result
 }
 
-// TODO: Make this actually return a proper error response
-fn respond_with_error(reason: RCode) {
-    // Build a header with the error code set
-    // Build the qname (if one was provided)
-    // Send the response
-    log::error!("ERROR: {:?}", reason);
+fn respond_with_qname_error(
+    reason: RCode,
+    input_header: &Header,
+    raw_query_name: &[u8],
+    type_and_class: &TypeAndClass,
+    response_buffer: &mut [u8; MAX_UDP_QUERY_SIZE],
+    socket: &UdpSocket,
+    src: &SocketAddr,
+) -> Result<(), Box<dyn Error>> {
+    log::error!("QName Error: {:?}", reason);
+
+    log::debug!("Creating header response");
+    // Copy OPCODE directly from input and set QR to say this is a query response
+    let response_flags_and_codes: u16 = (input_header.flags_and_codes.get()
+        & 0b0_1111_0_0_1_0_000_0000)
+        | create_flags_and_codes(HashSet::from([HeaderFlag::QR, HeaderFlag::RCODE(reason)]));
+    let mut output_index = write_out_header_data(
+        true,
+        response_buffer,
+        input_header,
+        response_flags_and_codes,
+    );
+
+    log::debug!("Creating qname response");
+    let raw_qname_as_bytes: &[u8] = &raw_query_name.as_bytes();
+    write_out_qname_data(
+        response_buffer,
+        &type_and_class,
+        &mut output_index,
+        raw_qname_as_bytes,
+    );
+
+    log::debug!("Sending error response.");
+    socket.send_to(&response_buffer[0..output_index], &src)?;
+    log::info!("Error response sent.");
+    Ok(())
 }
 
-fn append_to_buffer(response_buffer: &mut [u8; 512], value: &[u8], index: &mut usize) {
-    _ = &response_buffer[*index..*index + value.len()].copy_from_slice(value);
-    *index += value.len();
+fn respond_with_basic_error(
+    reason: RCode,
+    input_header: &Header,
+    response_buffer: &mut [u8; MAX_UDP_QUERY_SIZE],
+    socket: &UdpSocket,
+    src: &SocketAddr,
+) -> Result<(), Box<dyn Error>> {
+    log::error!("Basic Error: {:?}", reason);
+
+    log::debug!("Creating header response");
+    let response_flags_and_codes: u16 = input_header.flags_and_codes.get()
+        | create_flags_and_codes(HashSet::from([HeaderFlag::QR, HeaderFlag::RCODE(reason)]));
+    let output_index = write_out_header_data(
+        true,
+        response_buffer,
+        input_header,
+        response_flags_and_codes,
+    );
+    log::debug!("Sending error response.");
+    socket.send_to(&response_buffer[0..output_index], &src)?;
+    log::info!("Error response sent.");
+    Ok(())
 }
 
+#[test]
+fn test_append_to_output_buffer() {
+    let mut output_buffer = [0; MAX_UDP_QUERY_SIZE];
+    let mut output_index: usize = 0;
+    output_buffer.fill(0);
+    append_to_output_buffer(&mut output_buffer, "HELLO".as_bytes(), &mut output_index);
+    assert_eq!(output_index, 5);
+    assert_eq!(&output_buffer[0..6], [72, 69, 76, 76, 79, 0]);
+}
 
-fn read_qname(initial_offset: u8, buf: &[u8; 512]) -> Result<(String, usize), Box<dyn Error>> {
+fn append_to_output_buffer(
+    output_buffer: &mut [u8; MAX_UDP_QUERY_SIZE],
+    value: &[u8],
+    output_index: &mut usize,
+) {
+    _ = &output_buffer[*output_index..*output_index + value.len()].copy_from_slice(value);
+    *output_index += value.len();
+}
+
+fn read_qname(
+    initial_offset: u8,
+    buf: &[u8; MAX_UDP_QUERY_SIZE],
+) -> Result<(String, usize), Box<dyn Error>> {
     let mut qname = Vec::new();
     let mut offset: u8 = initial_offset;
     let mut lsize = buf[usize::try_from(offset)?];
@@ -352,90 +540,115 @@ fn read_qname(initial_offset: u8, buf: &[u8; 512]) -> Result<(String, usize), Bo
     Ok((qname.join("."), usize::try_from(offset + 1)?))
 }
 
-const TYPE_A: u16 = 1;        // 1 a host address
-const TYPE_NS: u16 = 2;       // 2 an authoritative name server
-const TYPE_MD: u16 = 3;       // 3 a mail destination (Obsolete - use MX)
-const TYPE_MF: u16 = 4;       // 4 a mail forwarder (Obsolete - use MX)
-const TYPE_CNAME: u16 = 5;    // 5 the canonical name for an alias
-const TYPE_SOA: u16 = 6;      // 6 marks the start of a zone of authority
-const TYPE_MB: u16 = 7;       // 7 a mailbox domain name (EXPERIMENTAL)
-const TYPE_MG: u16 = 8;       // 8 a mail group member (EXPERIMENTAL)
-const TYPE_MR: u16 = 9;       // 9 a mail rename domain name (EXPERIMENTAL)
-const TYPE_NULL: u16 = 10;    // 10 a null RR (EXPERIMENTAL)
-const TYPE_WKS: u16 = 11;     // 11 a well known service description
-const TYPE_PTR: u16 = 12;     // 12 a domain name pointer
-const TYPE_HINFO: u16 = 13;   // 13 host information
-const TYPE_MINFO: u16 = 14;   // 14 mailbox or mail list information
-const TYPE_MX: u16 = 15;      // 15 mail exchange
-const TYPE_TXT: u16 = 16;     // 16 text strings
-const QTYPE_AXFR: u16 = 252;  // 252 A request for a transfer of an entire zone
-const QTYPE_MAILB: u16 = 253; // 253 A request for mailbox-related records (MB, MG or MR)
-const QTYPE_MAILA: u16 = 254; // 254 A request for mail agent RRs (Obsolete - see MX)
-
+const TYPE_TXT: u16 = 16;
 fn query_type_to_string_slice(p: u16) -> &'static str {
     match p {
-        TYPE_A => "A",
-        TYPE_NS => "NS",
-        TYPE_MD => "MD",
-        TYPE_MF => "MF",
-        TYPE_CNAME => "CNAME",
-        TYPE_SOA => "SOA",
-        TYPE_MB => "MB",
-        TYPE_MG => "MG",
-        TYPE_MR => "MR",
-        TYPE_NULL => "NULL",
-        TYPE_WKS => "WKS",
-        TYPE_PTR => "PTR",
-        TYPE_HINFO => "HINFO",
-        TYPE_MINFO => "MINFO",
-        TYPE_MX => "MX",
-        TYPE_TXT => "TXT",
-        QTYPE_AXFR => "AXFR",
-        QTYPE_MAILB => "MAILB",
-        QTYPE_MAILA => "MAILA",
-        _ => "UNKNOWN"
+        1 => "A",          // 1 a host address
+        2 => "NS",         // 2 an authoritative name server
+        3 => "MD",         // 3 a mail destination (Obsolete - use MX)
+        4 => "MF",         // 4 a mail forwarder (Obsolete - use MX)
+        5 => "CNAME",      // 5 the canonical name for an alias
+        6 => "SOA",        // 6 marks the start of a zone of authority
+        7 => "MB",         // 7 a mailbox domain name (EXPERIMENTAL)
+        8 => "MG",         // 8 a mail group member (EXPERIMENTAL)
+        9 => "MR",         // 9 a mail rename domain name (EXPERIMENTAL)
+        10 => "NULL",      // 10 a null RR (EXPERIMENTAL)
+        11 => "WKS",       // 11 a well known service description
+        12 => "PTR",       // 12 a domain name pointer
+        13 => "HINFO",     // 13 host information
+        14 => "MINFO",     // 14 mailbox or mail list information
+        15 => "MX",        // 15 mail exchange
+        TYPE_TXT => "TXT", // 16 text strings
+        252 => "AXFR",     // 252 A request for a transfer of an entire zone
+        253 => "MAILB",    // 253 A request for mailbox-related records (MB, MG or MR)
+        254 => "MAILA",    // 254 A request for mail agent RRs (Obsolete - see MX)
+        _ => "UNKNOWN",
     }
 }
 
-const QCLASS_IN: u16 = 1; // IN - INternet
-const QCLASS_CS: u16 = 2; // CS - CSNET, obsolete
-const QCLASS_CH: u16 = 3; // CH - CHaosNet, obsolete
-const QCLASS_HS: u16 = 4; // HS - HeSiod, obsolte
-const QCLASS_ANY: u16 = 255; // * - ANY class
+const QCLASS_IN: u16 = 1;
+const QCLASS_ANY: u16 = 5;
 
 fn query_class_to_string_slice(p: u16) -> &'static str {
     match p {
-        QCLASS_IN => "IN",
-        QCLASS_CS => "CS",
-        QCLASS_CH => "CH",
-        QCLASS_HS => "HS",
-        QCLASS_ANY => "*",
-        _ => "UNKNOWN"
+        QCLASS_IN => "IN", // IN - INternet
+        2 => "CS",         // CS - CSNET, obsolete
+        3 => "CH",         // CH - CHaosNet, obsolete
+        4 => "HS",         // HS - HeSiod, obsolte
+        QCLASS_ANY => "*", // * - ANY class
+        _ => "UNKNOWN",
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_append_to_output_buffer() {
+        let mut output_buffer = [0; MAX_UDP_QUERY_SIZE];
+        let mut output_index: usize = 0;
+        output_buffer.fill(0);
+        append_to_output_buffer(&mut output_buffer, "HELLO".as_bytes(), &mut output_index);
+        assert_eq!(output_index, 5);
+        assert_eq!(&output_buffer[0..6], [72, 69, 76, 76, 79, 0]);
+    }
+
     #[test]
     fn test_set_opcode_flag() {
-        assert_eq!(create_flags_and_codes(HashSet::from([HeaderFlag::OPCODE(OpCode::QUERY)])), 0b0_0000_00000000000);
-        assert_eq!(create_flags_and_codes(HashSet::from([HeaderFlag::OPCODE(OpCode::IQUERY)])), 0b0_0001_00000000000);
-        assert_eq!(create_flags_and_codes(HashSet::from([HeaderFlag::OPCODE(OpCode::STATUS)])), 0b0_0010_00000000000);
+        assert_eq!(
+            create_flags_and_codes(HashSet::from([HeaderFlag::OPCODE(OpCode::QUERY)])),
+            0b0_0000_00000000000
+        );
+        assert_eq!(
+            create_flags_and_codes(HashSet::from([HeaderFlag::OPCODE(OpCode::IQUERY)])),
+            0b0_0001_00000000000
+        );
+        assert_eq!(
+            create_flags_and_codes(HashSet::from([HeaderFlag::OPCODE(OpCode::STATUS)])),
+            0b0_0010_00000000000
+        );
     }
 
     #[test]
     fn test_set_rpcode_flag() {
-        assert_eq!(create_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::NoError)])), 0b000000000000_0000);
-        assert_eq!(create_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::FormatError)])), 0b000000000000_0001);
-        assert_eq!(create_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::ServerFailure)])), 0b000000000000_0010);
-        assert_eq!(create_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::NameError)])), 0b000000000000_0011);
-        assert_eq!(create_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::NotImplemented)])), 0b000000000000_0100);
-        assert_eq!(create_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::Refused)])), 0b000000000000_0101);
+        assert_eq!(
+            create_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::NoError)])),
+            0b000000000000_0000
+        );
+        assert_eq!(
+            create_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::FormatError)])),
+            0b000000000000_0001
+        );
+        assert_eq!(
+            create_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::ServerFailure)])),
+            0b000000000000_0010
+        );
+        assert_eq!(
+            create_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::NameError)])),
+            0b000000000000_0011
+        );
+        assert_eq!(
+            create_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::NotImplemented)])),
+            0b000000000000_0100
+        );
+        assert_eq!(
+            create_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::Refused)])),
+            0b000000000000_0101
+        );
     }
 
     #[test]
     fn test_combine_some_flag() {
-        assert_eq!(create_flags_and_codes(HashSet::from([HeaderFlag::QR, HeaderFlag::AA, HeaderFlag::TC, HeaderFlag::RD, HeaderFlag::RA])), 0b1_0000_1_1_1_1_000_0000);
+        assert_eq!(
+            create_flags_and_codes(HashSet::from([
+                HeaderFlag::QR,
+                HeaderFlag::AA,
+                HeaderFlag::TC,
+                HeaderFlag::RD,
+                HeaderFlag::RA
+            ])),
+            0b1_0000_1_1_1_1_000_0000
+        );
     }
 }

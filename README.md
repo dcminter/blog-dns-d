@@ -1,4 +1,4 @@
-# blog-dns-d - abusing DNS for micro-blogging
+# blog-dns-d - a daemon for micro-blogging via DNS TXT records
 
 The idea is that this will allow micro content (limited to 255 bytes not counting the DNS query/answer
 overhead) to be rendered when a suitable nerd polls the DNS server
@@ -13,18 +13,22 @@ of garbage to stdout as it goes.
 
 Execute (requires su because it runs on port 53)
 ```bash
-$ sudo ./target/debug/blog-dns-d 
+$ sudo ./target/debug/blog-dns-d --message 'Good Grief Penfold!' --qname 'blog.paperstack.com'
 ```
-
 Then invoke via dig:
 ```bash
 $ dig +short @127.0.0.1 blog.paperstack.com TXT
-"OUTPUT"
+"Good Grief Penfold!"
 ```
+
+The qname is mandatory - you'll want to set it to your own thing, but the message 
+defaults to "Hello world!" if not explicitly set.
+
+There are some basic logging capabilities either via the `--log` flag (see `--help`) or the 
+same values can be set via a `BLOG_DNSD_LOG` environment variable.
 
 ## Next steps:
 
-  * Clean up (e.g. error handling, logging) and parameterise things
   * Work out an approach for content creation and storage!
   * Deploy it somewhere
   * Brag
