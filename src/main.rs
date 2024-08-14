@@ -1,4 +1,6 @@
 use clap::Parser;
+use env_logger::{Builder, Env};
+use log;
 use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::error::Error;
@@ -60,7 +62,8 @@ const RD_MASK: u16 = 0b0000000100000000;
 const RA_MASK: u16 = 0b0000000010000000;
 const RCODE_MASK: u16 = 0b0000000000001111;
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, Hash, Debug)]
+#[allow(dead_code)]
 enum OpCode {
     QUERY,
     IQUERY,
@@ -77,7 +80,8 @@ impl OpCode {
     }
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, Hash, Debug)]
+#[allow(dead_code)]
 enum RCode {
     NoError,
     FormatError,
@@ -100,7 +104,8 @@ impl RCode {
     }
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq, Hash, Debug)]
+#[allow(dead_code)]
 enum HeaderFlag {
     QR,
     OPCODE(OpCode),
@@ -161,33 +166,52 @@ const QUERY: bool = false;
 const INITIAL_OFFSET: u8 = 12;
 const MAX_UDP_QUERY_SIZE: usize = 512;
 
+const DEFAULT_LOGGING_ENV_VAR: &str = "BLOG_DNSD_LOG";
+
 fn main() -> std::io::Result<()> {
     let options: Opts = Opts::parse();
-    let _ = options.logs.unwrap(); // TODO... set up and use logging!
+    let logging_level = options.logs.unwrap();
+
+    Builder::from_env(Env::default().filter_or(DEFAULT_LOGGING_ENV_VAR, logging_level)).init();
 
     let message = options.message.unwrap_or("No message".to_string());
-    let qname = options.qname;
+    let target_qname = options.qname;
 
-    print!("Binding socket...");
+    log::debug!("Binding socket.");
     let socket = UdpSocket::bind("127.0.0.1:53")?;
-    println!("bound.");
+    log::debug!("Socket bound.");
 
-    println!("Will respond with {} for domain {}", message, qname);
+    log::info!("Will respond with '{}' for domain '{}'", message, target_qname);
 
     let mut query_buffer = [0; MAX_UDP_QUERY_SIZE];
     let mut response_buffer = [0; MAX_UDP_QUERY_SIZE];
 
     loop {
-        println!("Listening...");
+        log::debug!("Listening...");
         let (_amt, src) = socket.recv_from(&mut query_buffer)?;
 
+        // TODO:: Kick off a thread/task/something to do this instead of blocking the next connection...?
+
         let header = Header::ref_from(&query_buffer[0..12]).unwrap();
-        println!("ID: {}, (Flags), QD: {}, AN: {}, NS: {}, AR: {}", header.id, header.qdcount, header.ancount, header.nscount, header.arcount);
-        println!("QR: {}, OPCODE: {}, AA: {}, TC: {}, RD: {}, RA: {}, RCODE: {}", header.qr(), header.opcode(), header.aa(), header.tc(), header.rd(), header.ra(), header.rcode());
+        log::debug!("ID: {}, (Flags), QD: {}, AN: {}, NS: {}, AR: {}", header.id, header.qdcount, header.ancount, header.nscount, header.arcount);
+        log::debug!("QR: {}, OPCODE: {}, AA: {}, TC: {}, RD: {}, RA: {}, RCODE: {}", header.qr(), header.opcode(), header.aa(), header.tc(), header.rd(), header.ra(), header.rcode());
 
         // TODO: Handle bad record counts
-
         if header.qr() == QUERY {
+            match header.qdcount.get() {
+                1 => {}
+                0 => {
+                    // ERROR: Not supposed to be 0 because QR == QUERY
+                    respond_with_error(RCode::FormatError);
+                    continue;
+                }
+                _ => {
+                    // ERROR: We don't handle multiple queries
+                    respond_with_error(RCode::Refused);
+                    continue;
+                }
+            }
+
             let (qname, next_offset, raw_query_name) = match read_qname(INITIAL_OFFSET, &query_buffer) {
                 Ok((qname, next_offset)) => {
                     // Returning...
@@ -197,26 +221,25 @@ fn main() -> std::io::Result<()> {
                     (qname, next_offset, &query_buffer[INITIAL_OFFSET as usize..next_offset])
                 }
                 Err(err) => {
-                    println!("ERROR: {:?}", err);
+                    log::error!("ERROR: {:?}", err);
                     // Something went horribly wrong; not even trying for a response here...
                     continue;
                 }
             };
-            println!("Query name: {}", qname);
+            log::info!("Query name: {}", qname);
 
             let type_and_class = TypeAndClass::ref_from(&query_buffer[next_offset..next_offset + 4]).unwrap();
-            println!("Query Type: {}, Query Class: {}", query_type_to_string_slice(type_and_class.query_type.get()), query_class_to_string_slice(type_and_class.query_class.get()));
+            log::info!("Query Type: {}, Query Class: {}", query_type_to_string_slice(type_and_class.query_type.get()), query_class_to_string_slice(type_and_class.query_class.get()));
 
-            if !qname.eq_ignore_ascii_case("blog.paperstack.com") || type_and_class.query_type.get() != TYPE_TXT {
-                println!("Not a suitable qname query, or not expecting TXT type");
-                // TODO: Fail more politely!
-                respond_with_error();
+            if !qname.eq_ignore_ascii_case(&target_qname) || type_and_class.query_type.get() != TYPE_TXT {
+                log::error!("Not a suitable qname query, or not expecting TXT type");
+                respond_with_error(RCode::Refused);
                 continue;
             }
 
-            println!("Creating header response");
-            let mut response_flags_and_codes: u16 = header.flags_and_codes.get() & 0b0_1111_0_0_1_0_000_0000; // Copy OPCODE from input
-            response_flags_and_codes |= 0b1000000000000000; // Set QR to say this is a query response
+            log::debug!("Creating header response");
+            // Copy OPCODE directly from input and set QR to say this is a query response
+            let response_flags_and_codes: u16 = (header.flags_and_codes.get() & 0b0_1111_0_0_1_0_000_0000) | create_flags_and_codes(HashSet::from([HeaderFlag::QR]));
 
             let response_header = Header {
                 id: header.id,
@@ -233,14 +256,14 @@ fn main() -> std::io::Result<()> {
             let mut index = 0;
             append_to_buffer(&mut response_buffer, &response_header.as_bytes(), &mut index);
 
-            println!("Creating qname response");
+            log::debug!("Creating qname response");
 
             let raw_qname_index = index;
             let raw_qname_as_bytes: &[u8] = &raw_query_name.as_bytes();
             append_to_buffer(&mut response_buffer, raw_qname_as_bytes, &mut index);
             append_to_buffer(&mut response_buffer, &type_and_class.as_bytes(), &mut index);
 
-            println!("Creating resource record response");
+            log::debug!("Creating resource record response");
 
             let response_text = message.as_bytes();
             let response_text_length: u8 = response_text.len() as u8;
@@ -264,29 +287,18 @@ fn main() -> std::io::Result<()> {
             append_to_buffer(&mut response_buffer, &answer_record.record_length.as_bytes(), &mut index);
             append_to_buffer(&mut response_buffer, &answer_record.record_data.as_slice(), &mut index);
 
-            print!("Sending response...");
+            log::debug!("Sending response.");
 
             socket.send_to(&response_buffer[0..index], &src)?;
 
-            println!("sent.");
+            log::info!("Response sent.");
         } else {
-            respond_with_error();
+            respond_with_error(RCode::Refused);
         }
     }
 }
 
-/*
-    QR,
-    OPCODE(OpCode),
-    AA,
-    TC,
-    RD,
-    RA,
-    // Z bits are reserved and must be zero, so not included in this enum
-    RCODE(RCode)
-
- */
-fn set_flags_and_codes(flags: HashSet<HeaderFlag>) -> u16 {
+fn create_flags_and_codes(flags: HashSet<HeaderFlag>) -> u16 {
     let mut result: u16 = 0;
     flags.iter().for_each(|flag| {
         match flag {
@@ -304,13 +316,12 @@ fn set_flags_and_codes(flags: HashSet<HeaderFlag>) -> u16 {
     result
 }
 
-
 // TODO: Make this actually return a proper error response
-fn respond_with_error() {
+fn respond_with_error(reason: RCode) {
     // Build a header with the error code set
     // Build the qname (if one was provided)
     // Send the response
-    println!("ERROR");
+    log::error!("ERROR: {:?}", reason);
 }
 
 fn append_to_buffer(response_buffer: &mut [u8; 512], value: &[u8], index: &mut usize) {
@@ -408,23 +419,23 @@ mod test {
     use super::*;
     #[test]
     fn test_set_opcode_flag() {
-        assert_eq!(set_flags_and_codes(HashSet::from([HeaderFlag::OPCODE(OpCode::QUERY)])), 0b0_0000_00000000000);
-        assert_eq!(set_flags_and_codes(HashSet::from([HeaderFlag::OPCODE(OpCode::IQUERY)])), 0b0_0001_00000000000);
-        assert_eq!(set_flags_and_codes(HashSet::from([HeaderFlag::OPCODE(OpCode::STATUS)])), 0b0_0010_00000000000);
+        assert_eq!(create_flags_and_codes(HashSet::from([HeaderFlag::OPCODE(OpCode::QUERY)])), 0b0_0000_00000000000);
+        assert_eq!(create_flags_and_codes(HashSet::from([HeaderFlag::OPCODE(OpCode::IQUERY)])), 0b0_0001_00000000000);
+        assert_eq!(create_flags_and_codes(HashSet::from([HeaderFlag::OPCODE(OpCode::STATUS)])), 0b0_0010_00000000000);
     }
 
     #[test]
     fn test_set_rpcode_flag() {
-        assert_eq!(set_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::NoError)])), 0b000000000000_0000);
-        assert_eq!(set_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::FormatError)])), 0b000000000000_0001);
-        assert_eq!(set_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::ServerFailure)])), 0b000000000000_0010);
-        assert_eq!(set_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::NameError)])), 0b000000000000_0011);
-        assert_eq!(set_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::NotImplemented)])), 0b000000000000_0100);
-        assert_eq!(set_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::Refused)])), 0b000000000000_0101);
+        assert_eq!(create_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::NoError)])), 0b000000000000_0000);
+        assert_eq!(create_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::FormatError)])), 0b000000000000_0001);
+        assert_eq!(create_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::ServerFailure)])), 0b000000000000_0010);
+        assert_eq!(create_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::NameError)])), 0b000000000000_0011);
+        assert_eq!(create_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::NotImplemented)])), 0b000000000000_0100);
+        assert_eq!(create_flags_and_codes(HashSet::from([HeaderFlag::RCODE(RCode::Refused)])), 0b000000000000_0101);
     }
 
     #[test]
     fn test_combine_some_flag() {
-        assert_eq!(set_flags_and_codes(HashSet::from([HeaderFlag::QR, HeaderFlag::AA, HeaderFlag::TC, HeaderFlag::RD, HeaderFlag::RA])), 0b1_0000_1_1_1_1_000_0000);
+        assert_eq!(create_flags_and_codes(HashSet::from([HeaderFlag::QR, HeaderFlag::AA, HeaderFlag::TC, HeaderFlag::RD, HeaderFlag::RA])), 0b1_0000_1_1_1_1_000_0000);
     }
 }
