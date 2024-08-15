@@ -1,16 +1,20 @@
+use async_std::net::{SocketAddr, UdpSocket};
 use clap::Parser;
 use env_logger::{Builder, Env};
 use log;
 use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::error::Error;
-use std::net::{SocketAddr, UdpSocket};
 use std::str;
 use zerocopy::byteorder::network_endian::{I32, U16};
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 #[derive(Parser, Debug)]
-#[command(version = env ! ("CARGO_PKG_VERSION"), author = env ! ("CARGO_PKG_AUTHORS"), about, long_about = None
+#[command(
+    version = env ! ("CARGO_PKG_VERSION"),
+    author = env ! ("CARGO_PKG_AUTHORS"),
+    about,
+    long_about = None
 )]
 struct Opts {
     /// The message to return
@@ -167,7 +171,8 @@ const MAX_UDP_QUERY_SIZE: usize = 512;
 
 const DEFAULT_LOGGING_ENV_VAR: &str = "BLOG_DNSD_LOG";
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     let options: Opts = Opts::parse();
     let logging_level = options.logs.unwrap();
 
@@ -177,7 +182,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let target_qname = options.qname;
 
     log::debug!("Binding socket.");
-    let socket = UdpSocket::bind("127.0.0.1:53")?;
+    let socket = UdpSocket::bind("127.0.0.1:53").await?;
     log::debug!("Socket bound.");
 
     log::info!(
@@ -191,7 +196,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     loop {
         log::debug!("Listening...");
-        let (_amt, src) = socket.recv_from(&mut query_buffer)?;
+        let (_amt, src) = socket.recv_from(&mut query_buffer).await?;
 
         // TODO:: Kick off a thread/task/something to do this instead of blocking the next connection...?
 
@@ -227,7 +232,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                         &mut output_buffer,
                         &socket,
                         &src,
-                    )?;
+                    )
+                    .await?;
                     continue;
                 }
                 _ => {
@@ -238,7 +244,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                         &mut output_buffer,
                         &socket,
                         &src,
-                    )?;
+                    )
+                    .await?;
                     continue;
                 }
             }
@@ -285,7 +292,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     &mut output_buffer,
                     &socket,
                     &src,
-                )?;
+                )
+                .await?;
                 continue;
             }
 
@@ -361,7 +369,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             log::debug!("Sending response.");
 
-            socket.send_to(&output_buffer[0..output_index], &src)?;
+            socket
+                .send_to(&output_buffer[0..output_index], &src)
+                .await?;
 
             log::info!("Response sent.");
         } else {
@@ -371,7 +381,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 &mut output_buffer,
                 &socket,
                 &src,
-            )?;
+            )
+            .await?;
         }
     }
 }
@@ -434,7 +445,7 @@ fn create_flags_and_codes(flags: HashSet<HeaderFlag>) -> u16 {
     result
 }
 
-fn respond_with_qname_error(
+async fn respond_with_qname_error(
     reason: RCode,
     input_header: &Header,
     raw_query_name: &[u8],
@@ -467,12 +478,14 @@ fn respond_with_qname_error(
     );
 
     log::debug!("Sending error response.");
-    socket.send_to(&response_buffer[0..output_index], &src)?;
+    socket
+        .send_to(&response_buffer[0..output_index], &src)
+        .await?;
     log::info!("Error response sent.");
     Ok(())
 }
 
-fn respond_with_basic_error(
+async fn respond_with_basic_error(
     reason: RCode,
     input_header: &Header,
     response_buffer: &mut [u8; MAX_UDP_QUERY_SIZE],
@@ -491,7 +504,9 @@ fn respond_with_basic_error(
         response_flags_and_codes,
     );
     log::debug!("Sending error response.");
-    socket.send_to(&response_buffer[0..output_index], &src)?;
+    socket
+        .send_to(&response_buffer[0..output_index], &src)
+        .await?;
     log::info!("Error response sent.");
     Ok(())
 }
